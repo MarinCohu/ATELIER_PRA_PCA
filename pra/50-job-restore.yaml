@@ -10,11 +10,20 @@ spec:
       containers:
         - name: restore
           image: alpine
+          env:
+            - name: BACKUP_NAME
+              value: ""
           command: ["/bin/sh","-c"]
           args:
             - |
-              LATEST=$(ls -t /backup/*.db | head -1)
-              cp $LATEST /data/app.db
+              if [ -z "$BACKUP_NAME" ]; then
+                TARGET=$(ls -t /backup/*.db | head -1)
+                echo "Restauration du dernier backup : $TARGET"
+              else
+                TARGET="/backup/$BACKUP_NAME"
+                echo "Restauration du point spécifique : $TARGET"
+              fi
+              cp "$TARGET" /data/app.db
           volumeMounts:
             - name: data
               mountPath: /data
