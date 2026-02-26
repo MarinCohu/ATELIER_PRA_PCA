@@ -231,27 +231,40 @@ Faites preuve de pédagogie et soyez clair dans vos explications et procedures d
 **Exercice 1 :**  
 Quels sont les composants dont la perte entraîne une perte de données ?  
   
-*..Répondez à cet exercice ici..*
+Dans l'architecture actuelle, la perte du disque du node (le support physique du cluster k3d) entraîne une perte totale et définitive des données. Bien que les données soient répliquées entre deux volumes logiques (pra-data et pra-backup), le schéma montre qu'ils reposent sur la même infrastructure matérielle. Une corruption simultanée des deux PVC par une erreur humaine ou un script d'automatisation défaillant supprimerait également l'intégralité des informations, car il n'existe pas de copie hors site.
 
 **Exercice 2 :**  
 Expliquez nous pourquoi nous n'avons pas perdu les données lors de la supression du PVC pra-data  
   
-*..Répondez à cet exercice ici..*
+La conservation des données lors de la destruction du PVC pra-data est rendue possible par la mise en œuvre d'une stratégie de Plan de Reprise d'Activité (PRA). Le système utilise un CronJob Kubernetes qui, toutes les minutes, effectue une copie à chaud de la base SQLite app.db vers un second volume persistant nommé pra-backup. Ainsi, lorsque le volume de production est supprimé, le volume de sauvegarde reste intact, permettant au Job sqlite-restore de restaurer l'état le plus récent dans un nouveau volume de production.
 
 **Exercice 3 :**  
 Quels sont les RTO et RPO de cette solution ?  
   
-*..Répondez à cet exercice ici..*
+Le RPO (Recovery Point Objective), qui représente la perte de données maximale admissible, est ici de 1 minute. Cela correspond à la fréquence d'exécution de la tâche CRON de sauvegarde (*/1 * * * *).
+Le RTO (Recovery Time Objective), soit le temps nécessaire pour rétablir le service, est estimé à quelques minutes. Ce délai inclut le temps de détection du sinistre, la mise à l'échelle à zéro du déploiement, l'exécution manuelle du Job de restauration et le redémarrage des pods applicatifs.
 
 **Exercice 4 :**  
 Pourquoi cette solution (cet atelier) ne peux pas être utilisé dans un vrai environnement de production ? Que manque-t-il ?   
   
-*..Répondez à cet exercice ici..*
+Cet atelier est un modèle simplifié qui présente plusieurs vulnérabilités majeures :
+
+* Absence de redondance géographique : Production et sauvegardes partagent le même disque et le même cluster. Un incendie dans le centre de données ou une panne de zone chez le fournisseur cloud détruirait les deux simultanément.
+
+* Technologie de base de données inadaptée : SQLite n'est pas conçu pour des accès concurrents élevés en production (verrouillage de fichier).
+
+* Restauration manuelle : La procédure nécessite une intervention humaine, ce qui est incompatible avec des exigences de haute disponibilité strictes.
   
 **Exercice 5 :**  
 Proposez une archtecture plus robuste.   
   
-*..Répondez à cet exercice ici..*
+Pour une infrastructure résiliente, il est recommandé de migrer vers une solution "Cloud Native" :
+
+1. Base de données managée : Remplacer SQLite par un service comme AWS RDS ou Google Cloud SQL en mode Multi-AZ (Multi-Zones de disponibilité) pour assurer un PCA (Continuité) automatique avec basculement sans perte de données.
+
+2. Stockage externe : Exporter les sauvegardes périodiques vers un stockage objet (type S3 ou GCS) bénéficiant d'une réplication inter-régions pour garantir la survie des données en cas de catastrophe régionale.
+
+3. Haute disponibilité applicative : Déployer l'application sur plusieurs zones avec un Ingress Controller et un Load Balancer pour éliminer le point de défaillance unique du node actuel.
 
 ---------------------------------------------------
 Séquence 6 : Ateliers  
@@ -263,13 +276,37 @@ Difficulté : Moyenne (~2 heures)
 * last_backup_file : nom du dernier backup présent dans /backup
 * backup_age_seconds : âge du dernier backup
 
-*..**Déposez ici une copie d'écran** de votre réussite..*
+<img width="861" height="319" alt="image" src="https://github.com/user-attachments/assets/72fd1fc8-67ba-4554-9e2e-09a96e6a9115" />
 
 ---------------------------------------------------
 ### **Atelier 2 : Choisir notre point de restauration**  
 Aujourd’hui nous restaurobs “le dernier backup”. Nous souhaitons **ajouter la capacité de choisir un point de restauration**.
 
-*..Décrir ici votre procédure de restauration (votre runbook)..*  
+**RUNBOOK**
+
+La mise en œuvre d'un plan de reprise d'activité nécessite une approche structurée pour garantir l'intégrité des données restaurées. Tout d'abord, il est essentiel d'identifier le point de restauration cible en consultant les fichiers de sauvegarde stockés, dont le nom respecte la structure ```app-<timestamp>.db```. 
+
+Cette identification peut se faire soit via la route applicative /status, soit par une inspection directe du volume à l'aide de la commande :
+```kubectl -n pra exec -it $(kubectl -n pra get pod -l app=flask -o name) -- ls /backup```. 
+
+Une fois le fichier choisi, la production doit être isolée pour éviter tout conflit d'écriture ou corruption durant la copie. Cette isolation s'effectue en suspendant le trafic vers la base de données avec :
+```kubectl -n pra scale deployment flask --replicas=0``` ;
+Et en mettant en pause le mécanisme de sauvegarde automatique via la commande :
+```kubectl -n pra patch cronjob sqlite-backup -p '{"spec":{"suspend":true}}'```.
+
+
+L'étape suivante consiste à préparer le déclencheur de restauration en éditant le fichier de configuration ```pra/50-job-restore.yaml```. Il convient d'y spécifier le nom du fichier retenu dans la variable d'environnement ```BACKUP_NAME```, ce qui permet au script de restauration de cibler l'archive précise plutôt que d'utiliser la plus récente par défaut. L'exécution proprement dite requiert la suppression de toute instance précédente du job avec :
+```kubectl -n pra delete job sqlite-restore --ignore-not-found``` ;
+Suivie de la soumission de la nouvelle configuration par :
+```kubectl apply -f pra/50-job-restore.yaml```. 
+Ce processus assure l'écrasement contrôlé de la base de données active par la version sauvegardée.
+
+
+Enfin, le retour à un état opérationnel normal est finalisé par le redémarrage de l'application Flask avec :
+```kubectl -n pra scale deployment flask --replicas=1``` 
+Et la réactivation de la tâche planifiée de sauvegarde par 
+```kubectl -n pra patch cronjob sqlite-backup -p '{"spec":{"suspend":false}}'```
+La validité de la restauration est confirmée par une vérification finale des données via les routes ```/consultation``` ou ```/count``` afin de s'assurer que l'état de la base de données correspond exactement au point de restauration sélectionné.  
   
 ---------------------------------------------------
 Evaluation
